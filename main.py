@@ -5,127 +5,106 @@ import numpy as np
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 from typing import List, Dict
 
 # --- Configuration ---
 AI_PIPE_TOKEN = os.getenv("AI_PIPE_TOKEN", "your_token_here")
-AI_PIPE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
-MODEL_NAME = "openai/gpt-4o-mini"
-EMBED_MODEL = "all-MiniLM-L6-v2"
+# AI PIPE standard endpoints
+BASE_URL = "https://aipipe.org/openrouter/v1"
+CHAT_URL = f"{BASE_URL}/chat/completions"
+EMBED_URL = f"{BASE_URL}/embeddings"
 
-app = FastAPI(title="SearchTech Two-Stage Pipeline")
+# Light but powerful models
+EMBED_MODEL = "text-embedding-3-small" 
+RERANK_MODEL = "openai/gpt-4o-mini"
 
-# --- In-Memory Store & Model Initialization ---
+app = FastAPI(title="SearchTech Lightweight Pipeline")
+
+# --- In-Memory Store ---
 DOCS = [
     {"id": i, "text": f"Abstract {i}: Scientific discovery regarding AI in search engines focusing on {topic}."}
     for i, topic in enumerate(["vector databases", "re-ranking", "transformers", "LLMs", "latency"] * 25)
 ]
 DOC_TEXTS = [d["text"] for d in DOCS]
 
-# Global variables for model and embeddings
-model = None
+# Global cache for embeddings
 doc_embeddings = None
 
-@app.on_event("startup")
-async def load_model():
-    global model, doc_embeddings
-    print("==> Loading Transformer Model...")
-    # Loading the model here ensures it only happens once when the server starts
-    model = SentenceTransformer(EMBED_MODEL)
-    print("==> Encoding 125 documents...")
-    embeddings = model.encode(DOC_TEXTS, convert_to_numpy=True)
-    # Normalize for Cosine Similarity
-    doc_embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-    print("==> System Ready for Search Tech Solutions.")
+# --- Helper: AI PIPE Wrapper ---
+async def call_aipipe_embed(texts: List[str]):
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            EMBED_URL,
+            headers={"Authorization": f"Bearer {AI_PIPE_TOKEN}"},
+            json={"model": EMBED_MODEL, "input": texts},
+            timeout=30.0
+        )
+        if response.status_code != 200:
+            raise Exception(f"AI PIPE Error: {response.text}")
+        data = response.json()["data"]
+        return np.array([item["embedding"] for item in data])
 
-# --- NEW: Health Check Endpoint ---
+@app.on_event("startup")
+async def startup_event():
+    global doc_embeddings
+    print("==> Requesting embeddings from AI PIPE for 125 docs...")
+    # We do this once so searches are fast later
+    doc_embeddings = await call_aipipe_embed(DOC_TEXTS)
+    # Normalize for Cosine Similarity
+    doc_embeddings = doc_embeddings / np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
+    print("==> System Ready.")
+
 @app.get("/health")
-async def health_check():
-    """
-    Endpoint for UptimeRobot or cron-job.org to ping 
-    to prevent the Render free tier from sleeping.
-    """
-    return {
-        "status": "online",
-        "model_loaded": model is not None,
-        "uptime_check": True,
-        "timestamp": time.time()
-    }
+def health():
+    return {"status": "online", "memory_friendly": True}
 
 # --- Search Logic ---
 class SearchRequest(BaseModel):
     query: str
     rerank: bool = True
 
-class SearchResponse(BaseModel):
-    results: List[Dict]
-    reranked: bool
-    metrics: Dict
-
-async def get_llm_score(client: httpx.AsyncClient, query: str, doc_text: str) -> float:
-    prompt = f"Query: {query}\nDocument: {doc_text}\n\nRate the relevance of this document to the query on a scale of 0-10. Respond with only the number."
+async def get_llm_score(client: httpx.AsyncClient, query: str, doc_text: str):
+    prompt = f"Query: {query}\nDoc: {doc_text}\nRate relevance 0-10. Respond with ONLY the number."
     try:
-        response = await client.post(
-            AI_PIPE_URL,
+        res = await client.post(
+            CHAT_URL,
             headers={"Authorization": f"Bearer {AI_PIPE_TOKEN}"},
-            json={
-                "model": MODEL_NAME,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0
-            },
+            json={"model": RERANK_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
             timeout=5.0
         )
-        res_json = response.json()
-        score_raw = res_json['choices'][0]['message']['content'].strip()
-        # Basic parsing of the LLM response
-        return float(score_raw) / 10.0
-    except Exception:
+        return float(res.json()['choices'][0]['message']['content'].strip()) / 10.0
+    except:
         return 0.0
 
-@app.post("/search", response_model=SearchResponse)
+@app.post("/search")
 async def search(request: SearchRequest):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model still loading, please wait.")
-        
     start_time = time.time()
     
-    # STAGE 1: Vector Search (Retrieval)
-    query_embedding = model.encode([request.query], convert_to_numpy=True)
-    query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
+    # STAGE 1: Vector Retrieval (via Cloud Embedding)
+    query_vec = await call_aipipe_embed([request.query])
+    query_vec = query_vec / np.linalg.norm(query_vec)
     
-    similarities = np.dot(doc_embeddings, query_embedding.T).flatten()
-    top_indices = np.argsort(similarities)[::-1][:8]
+    scores = np.dot(doc_embeddings, query_vec.T).flatten()
+    top_indices = np.argsort(scores)[::-1][:8]
     
-    retrieval_results = []
-    for idx in top_indices:
-        retrieval_results.append({
-            "id": DOCS[idx]["id"],
-            "text": DOCS[idx]["text"],
-            "score": float(similarities[idx])
-        })
+    results = [{"id": DOCS[i]["id"], "text": DOCS[i]["text"], "score": float(scores[i])} for i in top_indices]
+    retrieval_ms = (time.time() - start_time) * 1000
     
-    retrieval_time = (time.time() - start_time) * 1000
-    
-    # STAGE 2: Re-ranking (LLM)
+    # STAGE 2: Re-ranking
     rerank_start = time.time()
     if request.rerank:
         async with httpx.AsyncClient() as client:
-            tasks = [get_llm_score(client, request.query, res["text"]) for res in retrieval_results]
+            tasks = [get_llm_score(client, request.query, r["text"]) for r in results]
             llm_scores = await asyncio.gather(*tasks)
-            for i, score in enumerate(llm_scores):
-                retrieval_results[i]["rerank_score"] = score
-            # Re-sort based on LLM reasoning
-            retrieval_results.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
-
-    rerank_time = (time.time() - rerank_start) * 1000
-    
+            for i, s in enumerate(llm_scores):
+                results[i]["rerank_score"] = s
+            results.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+            
     return {
-        "results": retrieval_results,
-        "reranked": request.rerank,
+        "results": results,
         "metrics": {
-            "retrieval_ms": round(retrieval_time, 2),
-            "rerank_ms": round(rerank_time, 2),
+            "retrieval_ms": round(retrieval_ms, 2),
+            "rerank_ms": round((time.time() - rerank_start) * 1000, 2),
             "total_ms": round((time.time() - start_time) * 1000, 2)
         }
     }
