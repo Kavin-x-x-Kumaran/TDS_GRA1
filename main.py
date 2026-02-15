@@ -4,107 +4,92 @@ import asyncio
 import numpy as np
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # --- Configuration ---
-AI_PIPE_TOKEN = os.getenv("AI_PIPE_TOKEN", "your_token_here")
-# AI PIPE standard endpoints
+AI_PIPE_TOKEN = os.getenv("AI_PIPE_TOKEN")
 BASE_URL = "https://aipipe.org/openrouter/v1"
 CHAT_URL = f"{BASE_URL}/chat/completions"
 EMBED_URL = f"{BASE_URL}/embeddings"
 
-# Light but powerful models
-EMBED_MODEL = "text-embedding-3-small" 
-RERANK_MODEL = "openai/gpt-4o-mini"
+app = FastAPI(title="SearchTech Solutions Pipeline")
 
-app = FastAPI(title="SearchTech Lightweight Pipeline")
+# 1. FIX: Enable CORS so the AI Checker can reach you
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- In-Memory Store ---
-DOCS = [
-    {"id": i, "text": f"Abstract {i}: Scientific discovery regarding AI in search engines focusing on {topic}."}
-    for i, topic in enumerate(["vector databases", "re-ranking", "transformers", "LLMs", "latency"] * 25)
-]
+# --- Data & Embeddings ---
+DOCS = [{"id": i, "text": f"Abstract {i}: Scientific discovery regarding AI in search engines focusing on {topic}."}
+        for i, topic in enumerate(["vector databases", "re-ranking", "transformers", "LLMs", "latency"] * 25)]
 DOC_TEXTS = [d["text"] for d in DOCS]
-
-# Global cache for embeddings
 doc_embeddings = None
 
-# --- Helper: AI PIPE Wrapper ---
-async def call_aipipe_embed(texts: List[str]):
+async def get_embeddings(texts: List[str]):
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            EMBED_URL,
-            headers={"Authorization": f"Bearer {AI_PIPE_TOKEN}"},
-            json={"model": EMBED_MODEL, "input": texts},
-            timeout=30.0
-        )
-        if response.status_code != 200:
-            raise Exception(f"AI PIPE Error: {response.text}")
-        data = response.json()["data"]
-        return np.array([item["embedding"] for item in data])
+        res = await client.post(EMBED_URL, headers={"Authorization": f"Bearer {AI_PIPE_TOKEN}"},
+                                json={"model": "text-embedding-3-small", "input": texts}, timeout=30.0)
+        return np.array([item["embedding"] for item in res.json()["data"]])
 
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     global doc_embeddings
-    print("==> Requesting embeddings from AI PIPE for 125 docs...")
-    # We do this once so searches are fast later
-    doc_embeddings = await call_aipipe_embed(DOC_TEXTS)
-    # Normalize for Cosine Similarity
-    doc_embeddings = doc_embeddings / np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
-    print("==> System Ready.")
+    # Pre-compute to meet the <200ms requirement
+    doc_embeddings = await get_embeddings(DOC_TEXTS)
+    doc_embeddings /= np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
 
-@app.get("/health")
-def health():
-    return {"status": "online", "memory_friendly": True}
+# 2. FIX: Add Root Route
+@app.get("/")
+async def root():
+    return {"status": "running", "endpoint": "/search"}
 
-# --- Search Logic ---
+# 3. FIX: Match the exact schema required by SearchTech
 class SearchRequest(BaseModel):
     query: str
+    k: int = 8
     rerank: bool = True
-
-async def get_llm_score(client: httpx.AsyncClient, query: str, doc_text: str):
-    prompt = f"Query: {query}\nDoc: {doc_text}\nRate relevance 0-10. Respond with ONLY the number."
-    try:
-        res = await client.post(
-            CHAT_URL,
-            headers={"Authorization": f"Bearer {AI_PIPE_TOKEN}"},
-            json={"model": RERANK_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
-            timeout=5.0
-        )
-        return float(res.json()['choices'][0]['message']['content'].strip()) / 10.0
-    except:
-        return 0.0
+    rerankK: int = 5
 
 @app.post("/search")
-async def search(request: SearchRequest):
-    start_time = time.time()
+async def search(req: SearchRequest):
+    start_total = time.time()
     
-    # STAGE 1: Vector Retrieval (via Cloud Embedding)
-    query_vec = await call_aipipe_embed([request.query])
-    query_vec = query_vec / np.linalg.norm(query_vec)
-    
+    # Stage 1: Vector Search
+    query_vec = await get_embeddings([req.query])
+    query_vec /= np.linalg.norm(query_vec)
     scores = np.dot(doc_embeddings, query_vec.T).flatten()
-    top_indices = np.argsort(scores)[::-1][:8]
+    top_idx = np.argsort(scores)[::-1][:req.k]
     
-    results = [{"id": DOCS[i]["id"], "text": DOCS[i]["text"], "score": float(scores[i])} for i in top_indices]
-    retrieval_ms = (time.time() - start_time) * 1000
-    
-    # STAGE 2: Re-ranking
-    rerank_start = time.time()
-    if request.rerank:
+    results = [{"id": DOCS[i]["id"], "score": float(scores[i]), "content": DOCS[i]["text"]} for i in top_idx]
+    latency_retrieval = (time.time() - start_total) * 1000
+
+    # Stage 2: Re-ranking
+    if req.rerank:
         async with httpx.AsyncClient() as client:
-            tasks = [get_llm_score(client, request.query, r["text"]) for r in results]
-            llm_scores = await asyncio.gather(*tasks)
-            for i, s in enumerate(llm_scores):
-                results[i]["rerank_score"] = s
-            results.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
-            
+            tasks = []
+            for r in results:
+                prompt = f"Query: {req.query}\nDocument: {r['content']}\n\nRate the relevance of this document to the query on a scale of 0-10. Respond with only the number."
+                tasks.append(client.post(CHAT_URL, headers={"Authorization": f"Bearer {AI_PIPE_TOKEN}"},
+                                         json={"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0}))
+            responses = await asyncio.gather(*tasks)
+            for i, res in enumerate(responses):
+                val = res.json()['choices'][0]['message']['content'].strip()
+                results[i]["score"] = float(val) / 10.0 # Normalize 0-1
+        
+        results.sort(key=lambda x: x["score"], reverse=True)
+        results = results[:req.rerankK] # Return top 5 as requested
+
     return {
         "results": results,
+        "reranked": req.rerank,
         "metrics": {
-            "retrieval_ms": round(retrieval_ms, 2),
-            "rerank_ms": round((time.time() - rerank_start) * 1000, 2),
-            "total_ms": round((time.time() - start_time) * 1000, 2)
+            "latency": round((time.time() - start_total) * 1000, 2),
+            "totalDocs": 125
         }
     }
